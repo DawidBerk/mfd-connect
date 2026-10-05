@@ -31,7 +31,7 @@ from .util.console_utils import (
 )
 from .util.serial_utils import SerialKeyCode
 from .base import Connection, ConnectionCompletedProcess
-from .exceptions import SolException, ConnectionCalledProcessError, OsNotSupported
+from .exceptions import SolException, ConnectionCalledProcessError, OsNotSupported, SolLoginPromptDetected
 from .pathlib.path import CustomPath, custom_path_factory
 
 if typing.TYPE_CHECKING:
@@ -41,6 +41,13 @@ logger = logging.getLogger(__name__)
 add_logging_level(level_name="MODULE_DEBUG", level_value=log_levels.MODULE_DEBUG)
 add_logging_level(level_name="CMD", level_value=log_levels.CMD)
 add_logging_level(level_name="OUT", level_value=log_levels.OUT)
+
+# Generic, OS-agnostic patterns for an interactive login prompt (e.g. FreeBSD/Linux).
+LOGIN_PROMPT_PATTERNS = [
+    r"(?im)^.*\blogin:\s*$",  # e.g. "login:", "myhost login:", "FreeBSD/amd64 (host) (ttyu0)\n\nlogin:"
+    r"(?im)^.*\busername:\s*$",  # some distros/appliances prompt "Username:" instead of "login:"
+    r"(?im)^.*\bpassword(\s+\S.*)?:\s*$",  # e.g. "Password:", "myhost Password:", "Password for user 'root':"
+]
 
 
 class SolConnection(Connection):
@@ -83,6 +90,8 @@ class SolConnection(Connection):
             "\\\> \\x1b\[0m\\x1b\[37m\\x1b\[40m",  # noqa: W605
             "Shell> \\x1b\[0m\\x1b\[37m\\x1b\[40m",  # noqa: W605
         ]
+        # instance-level copy so callers/subclasses can extend/override patterns without touching the module constant
+        self._login_prompt_patterns = list(LOGIN_PROMPT_PATTERNS)
 
     def __str__(self):
         return "sol"
@@ -102,6 +111,7 @@ class SolConnection(Connection):
         expected_return_codes: Optional[Iterable] = frozenset({0}),
         shell: bool = True,
         custom_exception: Type[CalledProcessError] = None,
+        detect_login: bool = False,
     ) -> "ConnectionCompletedProcess":
         """
         Run program and wait for it's completion.
@@ -120,9 +130,11 @@ class SolConnection(Connection):
         :param skip_logging: Skip logging of stdout/stderr if captured
         :param custom_exception: Enable us to raise our exception if program exits with an unexpected return code.
         custom_exception must inherit from CalledProcessError to use its fields like returncode, cmd, output, stderr
+        :param detect_login: Flag to detect interactive login prompt in the response
 
         :return: Completed process object
         :raises ConnectionCalledProcessError: if program exits with an unexpected return code
+        :raises SolLoginPromptDetected: if an interactive login prompt is detected in the response
         """
         output = ""
         returncode = None
@@ -133,7 +145,7 @@ class SolConnection(Connection):
         logger.log(level=log_levels.CMD, msg=f"Executing {self._ip}>'{command}', cwd: {cwd}")
 
         if shell:
-            self._send_to_shell(command, retry_count=5)
+            self._send_to_shell(command, retry_count=5, detect_login=detect_login)
             self.wait_for_string(self._prompt, timeout=timeout)
         else:
             self._connection_handle.send(command + "\r")
@@ -143,6 +155,14 @@ class SolConnection(Connection):
             output = self._parse_output(output)
             if output and not skip_logging:
                 logger.log(level=log_levels.OUT, msg=f"output>>\n{output}")
+
+            if not shell and detect_login:
+                match = self._find_login_prompt_match(output)
+                if match:
+                    raise SolLoginPromptDetected(
+                        f"SoL console is waiting on an interactive login prompt: {match.group(0)!r} "
+                        f"(detected in response to {command!r})."
+                    )
 
         self._clear_buffer()
 
@@ -212,6 +232,19 @@ class SolConnection(Connection):
         if self._connection_handle.before:
             self._connection_handle.expect([r".+", pexpect.EOF, pexpect.TIMEOUT], timeout=1)
 
+    def _find_login_prompt_match(self, text: str) -> Optional[re.Match]:
+        """
+        Search text against all configured login-prompt patterns.
+
+        :param text: console output (already parsed/one-line) to inspect
+        :return: the first regex match found, or None if no pattern matched
+        """
+        for pattern in self._login_prompt_patterns:
+            match = re.search(pattern, text)
+            if match:
+                return match
+        return None
+
     def restart_platform(self) -> None:
         """Reboot host."""
         raise NotImplementedError("Restart is not implemented in SOL")
@@ -244,7 +277,20 @@ class SolConnection(Connection):
         logger.log(level=log_levels.MODULE_DEBUG, msg="lasterror not found")
         return -1
 
-    def _send_to_shell(self, command: str = "", retry_count: int = 10, reset_communication: bool = False) -> None:
+    def _send_to_shell(
+        self, command: str = "", retry_count: int = 10, reset_communication: bool = False, detect_login: bool = True
+    ) -> None:
+        """
+        Send a command to the shell, verifying it was echoed back correctly before pressing Enter.
+
+        :param command: command to send
+        :param retry_count: remaining attempts before giving up / resetting communication
+        :param reset_communication: whether a communication reset has already been attempted
+        :param detect_login: whether to check for an interactive login prompt in the console's response
+        :raises SolException: if sending the command keeps failing after exhausting retries
+        :raises SolLoginPromptDetected: if an interactive login prompt is recognized in the console's
+        response (e.g. it swallowed the command as a username and replied with "Password:")
+        """
         # clearing buffer
         while self.wait_for_string(self._prompt, expect_timeout=True, timeout=2) < len(self._prompt):
             continue
@@ -256,10 +302,12 @@ class SolConnection(Connection):
         if retry_count == 0 and not reset_communication:
             logger.log(
                 level=log_levels.MODULE_DEBUG,
-                msg="Resetting Sol communication and retrying to send command : {command}",
+                msg=f"Resetting Sol communication and retrying to send command : {command}",
             )
             self._reset_communication_handle()
-            return self._send_to_shell(command=command, retry_count=10, reset_communication=True)
+            return self._send_to_shell(
+                command=command, retry_count=10, reset_communication=True, detect_login=detect_login
+            )
 
         len_of_command = len(command)
         # code below is here because limited buffer length when sending
@@ -285,6 +333,17 @@ class SolConnection(Connection):
             self.send_key(SerialKeyCode.enter, sleeptime=1)
         # convert it to human-readable format using _parse_output
         buffer_after_send = self._parse_output(read_text, one_line=True)
+
+        # Concrete evidence: the console's response explicitly looks like a login prompt (e.g. it swallowed
+        # the command as a username and replied with "Password:").
+        if detect_login:
+            match = self._find_login_prompt_match(buffer_after_send)
+            if match:
+                raise SolLoginPromptDetected(
+                    f"SoL console is waiting on an interactive login prompt: {match.group(0)!r} "
+                    f"(detected while trying to send {command!r})."
+                )
+
         if command in buffer_after_send.split("\n"):
             self.send_key(SerialKeyCode.enter)
         else:
@@ -300,7 +359,10 @@ class SolConnection(Connection):
             logger.log(level=log_levels.CMD, msg=f"buffer: {buffer_after_send}")
             logger.log(level=log_levels.CMD, msg=f"command: {command}")
             return self._send_to_shell(
-                command=command, retry_count=retry_count - 1, reset_communication=reset_communication
+                command=command,
+                retry_count=retry_count - 1,
+                reset_communication=reset_communication,
+                detect_login=detect_login,
             )
 
     def _establish_connection(self, retry_count: int = 0) -> "pexpect.spawn":
@@ -702,17 +764,19 @@ class SolConnection(Connection):
 
     def _check_if_unix(self) -> bool:
         """Check if Unix is the client OS."""
+        self._raise_if_login_prompt()
         unix_check_command = "uname -a"
         try:
-            result = self.execute_command(unix_check_command, expected_return_codes=[0, 127])
+            result = self.execute_command(unix_check_command, expected_return_codes=[0, 127], detect_login=True)
             return not result.return_code
         except ConnectionCalledProcessError:
             return False
 
     def _get_unix_distribution(self) -> OSName:
         """Check distribution of connected Unix OS."""
+        self._raise_if_login_prompt()
         unix_check_command = "uname -o"
-        result = self.execute_command(unix_check_command, expected_return_codes=[0, 127])
+        result = self.execute_command(unix_check_command, expected_return_codes=[0, 127], detect_login=True)
         for os in OSName:
             if os.value in result.stdout:
                 return os
@@ -720,26 +784,65 @@ class SolConnection(Connection):
 
     def _check_if_efi_shell(self) -> bool:
         """Check if EFI shell is the client OS."""
+        self._raise_if_login_prompt()
         efi_shell_check_command = "ver"
         output = self.execute_command(
-            efi_shell_check_command, shell=False, expected_return_codes=None, timeout=5
+            efi_shell_check_command, shell=False, expected_return_codes=None, timeout=5, detect_login=True
         ).stdout
         return any(out in output for out in ["UEFI Shell", "UEFI Interactive Shell"])
 
+    def _raise_if_login_prompt(self, timeout: int = 2) -> None:
+        """
+        Raise if the console is currently waiting on an interactive login prompt.
+
+        Passively reads already-buffered/pending console output (sends nothing) and matches it against
+        generic login-prompt patterns. Typical case: SUT booted into an OS without auto-login enabled
+        (e.g. FreeBSD/Linux getty) - console shows "login:"/"Password:" instead of a shell prompt.
+
+        :param timeout: how long to wait for already-buffered console output to be read
+        :raises SolLoginPromptDetected: if an interactive login prompt was detected on the console
+        """
+        connection_handle = getattr(self, "_connection_handle", None)
+        if connection_handle is None:
+            return
+
+        try:
+            read_text = connection_handle.read_nonblocking(size=5000, timeout=timeout).decode("ASCII", errors="ignore")
+        except (pexpect.TIMEOUT, pexpect.EOF):
+            read_text = ""
+
+        output = self._parse_output(read_text, one_line=True)
+        match = self._find_login_prompt_match(output)
+        if match:
+            logger.log(level=log_levels.MODULE_DEBUG, msg=f"Detected login prompt on console: {match.group(0)!r}")
+            raise SolLoginPromptDetected(f"SoL console is waiting on an interactive login prompt: {match.group(0)!r}.")
+
     @conditional_cache
     def get_os_type(self) -> OSType:
-        """Get type of client OS."""
-        if self._check_if_unix():
-            return OSType.POSIX
+        """
+        Get type of client OS.
+
+        :raises SolLoginPromptDetected: if console is waiting on an interactive login prompt
+        """
+        self._raise_if_login_prompt()
 
         if self._check_if_efi_shell():
             return OSType.EFISHELL
+
+        if self._check_if_unix():
+            return OSType.POSIX
 
         raise OsNotSupported("Client OS not supported")
 
     @conditional_cache
     def get_os_name(self) -> OSName:
-        """Get name of client OS."""
+        """
+        Get name of client OS.
+
+        :raises SolLoginPromptDetected: if console is waiting on an interactive login prompt
+        """
+        self._raise_if_login_prompt()
+
         if self._check_if_efi_shell():
             return OSName.EFISHELL
 
@@ -750,14 +853,26 @@ class SolConnection(Connection):
 
     @conditional_cache
     def get_os_bitness(self) -> OSBitness:
-        """Get bitness of client os."""
+        """
+        Get bitness of client os.
+
+        :raises SolLoginPromptDetected: if console is waiting on an interactive login prompt
+        """
+        self._raise_if_login_prompt()
+
         if self._check_if_efi_shell():
             return OSBitness.OS_64BIT  # current requirements describe only required EFISHELL
         raise OsNotSupported("Client OS is not supported")
 
     @conditional_cache
     def get_cpu_architecture(self) -> CPUArchitecture:
-        """Get CPU architecture."""
+        """
+        Get CPU architecture.
+
+        :raises SolLoginPromptDetected: if console is waiting on an interactive login prompt
+        """
+        self._raise_if_login_prompt()
+
         if self._check_if_efi_shell():
             return CPUArchitecture.X86_64
         raise OsNotSupported("'get_cpu_architecture' not supported on that OS")

@@ -13,7 +13,8 @@ from pytest import raises, fixture
 
 from mfd_connect import SolConnection
 from mfd_connect.base import ConnectionCompletedProcess
-from mfd_connect.exceptions import OsNotSupported, SolException
+from mfd_connect.exceptions import OsNotSupported, SolException, SolLoginPromptDetected
+from mfd_connect.sol import LOGIN_PROMPT_PATTERNS
 from mfd_connect.util.serial_utils import SerialKeyCode
 
 
@@ -31,6 +32,17 @@ class TestSolConnection:
         sol._prompt = ""
         sol._ip = "10.10.10.10"
         sol.cache_system_data = True
+        sol._login_prompt_patterns = list(LOGIN_PROMPT_PATTERNS)
+        return sol
+
+    @staticmethod
+    def _ready_for_send_to_shell(sol, mocker):
+        """Configure the shared `sol` fixture for _send_to_shell-specific tests."""
+        sol._prompt = ["p1", "p2"]
+        # buffer-clearing loops in _send_to_shell must exit immediately (index == len(sol._prompt))
+        sol.wait_for_string = mocker.Mock(return_value=len(sol._prompt))
+        sol._connection_handle = mocker.Mock()
+        mocker.patch("mfd_connect.sol.time.sleep")
         return sol
 
     def test_get_os_bitness_os_not_supported(self, sol, mocker):
@@ -553,6 +565,8 @@ class TestSolConnection:
             ),
         )
         assert sol._check_if_unix()
+        # execute_command's own default for detect_login is False - _check_if_unix must opt in explicitly
+        sol.execute_command.assert_called_once_with("uname -a", expected_return_codes=[0, 127], detect_login=True)
 
     def test__check_if_unix_failure(self, sol, mocker):
         sol.execute_command = mocker.create_autospec(
@@ -578,6 +592,10 @@ class TestSolConnection:
             ),
         )
         assert sol._check_if_efi_shell()
+        # execute_command's own default for detect_login is False - _check_if_efi_shell must opt in explicitly
+        sol.execute_command.assert_called_once_with(
+            "ver", shell=False, expected_return_codes=None, timeout=5, detect_login=True
+        )
 
     def test__check_if_efi_shell_interactive_mode(self, sol, mocker):
         sol.execute_command = mocker.create_autospec(
@@ -786,6 +804,8 @@ class TestSolConnection:
             ),
         )
         assert sol._get_unix_distribution() == os_name
+        # execute_command's own default for detect_login is False - _get_unix_distribution must opt in explicitly
+        sol.execute_command.assert_called_once_with("uname -o", expected_return_codes=[0, 127], detect_login=True)
 
     def test_get_unix_distribution_fail(self, sol, mocker):
         sol.execute_command = mocker.create_autospec(
@@ -826,3 +846,237 @@ class TestSolConnection:
         cp.assert_called_once()
         # owner should be injected as self
         assert cp.call_args.kwargs["owner"] is sol
+
+    # --- Generic interactive login-prompt detection (e.g. FreeBSD/Linux) ---
+
+    def test_solloginpromptdetected_is_subclass_of_osnotsupported(self):
+        """Existing call-sites catching OsNotSupported must keep working unchanged."""
+        assert issubclass(SolLoginPromptDetected, OsNotSupported)
+
+    # --- _find_login_prompt_match: shared pattern-matching helper used by every detection site ---
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            pytest.param("login: ", id="bare_login"),
+            pytest.param("myhost login: ", id="login_with_hostname"),
+            pytest.param("Username: ", id="bare_username"),
+            pytest.param("Password: ", id="bare_password"),
+            pytest.param("myhost Password: ", id="password_with_hostname"),
+            pytest.param("Password for user 'root': ", id="qualified_password"),
+        ],
+    )
+    def test_find_login_prompt_match_matches_known_prompts(self, sol, text):
+        match = sol._find_login_prompt_match(text)
+
+        assert match is not None
+        assert match.group(0).strip() == text.strip()
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            pytest.param("UEFI Shell v2.2 Build 2.6.1", id="efi_shell_banner"),
+            pytest.param("Shell> uname -a", id="shell_prompt_with_command"),
+            pytest.param("", id="empty_string"),
+        ],
+    )
+    def test_find_login_prompt_match_returns_none_for_non_prompt_text(self, sol, text):
+        assert sol._find_login_prompt_match(text) is None
+
+    def test_find_login_prompt_match_returns_first_matching_pattern(self, sol):
+        """With multiple patterns able to match, the first one in `_login_prompt_patterns` order wins."""
+        match = sol._find_login_prompt_match("login: ")
+
+        assert match.re.pattern == sol._login_prompt_patterns[0]
+
+    def test_find_login_prompt_match_honours_instance_level_overrides(self, sol):
+        """Instance-level overrides of `_login_prompt_patterns` must be used, not the module-level constant."""
+        sol._login_prompt_patterns = [r"(?im)^.*\bcustom-prompt:\s*$"]
+
+        assert sol._find_login_prompt_match("Password: ") is None
+        match = sol._find_login_prompt_match("custom-prompt: ")
+        assert match is not None
+
+    @pytest.mark.parametrize(
+        "raw_buffer",
+        [
+            pytest.param(b"FreeBSD/amd64 (myhost.example.com) (ttyu0)\r\n\r\nlogin: ", id="freebsd_getty_banner"),
+            pytest.param(b"Ubuntu 22.04 LTS myhost ttyS0\r\n\r\nmyhost login: ", id="generic_linux_agetty"),
+            pytest.param(b"login: ", id="bare_login_prompt"),
+            pytest.param(b"Password: ", id="password_prompt"),
+            pytest.param(b"Username: ", id="username_prompt"),
+        ],
+    )
+    def test_raise_if_login_prompt_raises_on_detected_prompt(self, sol, raw_buffer):
+        sol._connection_handle = type("_Handle", (), {"read_nonblocking": lambda self, size, timeout: raw_buffer})()
+
+        with pytest.raises(SolLoginPromptDetected):
+            sol._raise_if_login_prompt()
+
+    def test_raise_if_login_prompt_no_new_data_does_not_raise(self, sol, mocker):
+        """On pexpect.TIMEOUT (nothing new buffered) there is no login prompt to report."""
+        sol._connection_handle = mocker.Mock()
+        sol._connection_handle.read_nonblocking.side_effect = pexpect.TIMEOUT("timed out")
+
+        sol._raise_if_login_prompt()  # must not raise
+
+    def test_raise_if_login_prompt_eof_does_not_raise(self, sol, mocker):
+        sol._connection_handle = mocker.Mock()
+        sol._connection_handle.read_nonblocking.side_effect = pexpect.EOF("eof")
+
+        sol._raise_if_login_prompt()  # must not raise
+
+    def test_raise_if_login_prompt_does_not_send_anything(self, sol, mocker):
+        """Detection must be read-only - no keys/commands sent to the console."""
+        sol._connection_handle = mocker.Mock()
+        sol._connection_handle.read_nonblocking.return_value = b"Shell> "
+
+        sol._raise_if_login_prompt()
+
+        sol._connection_handle.send.assert_not_called()
+
+    def test_raise_if_login_prompt_no_false_positive_on_efi_shell_output(self, sol, mocker):
+        sol._connection_handle = mocker.Mock()
+        sol._connection_handle.read_nonblocking.return_value = (
+            b"Dell Custom UEFI Shell v2.2\r\nDell Build 2.6.1\r\nShell> "
+        )
+
+        sol._raise_if_login_prompt()  # must not raise
+
+    def test_raise_if_login_prompt_no_connection_handle_does_not_raise(self, sol):
+        """Called before a connection handle exists (e.g. very early init) - must not blow up."""
+        sol._raise_if_login_prompt()  # must not raise
+
+    def test_raise_if_login_prompt_passes_timeout_to_read_nonblocking(self, sol, mocker):
+        sol._connection_handle = mocker.Mock()
+        sol._connection_handle.read_nonblocking.return_value = b""
+
+        sol._raise_if_login_prompt(timeout=5)
+
+        sol._connection_handle.read_nonblocking.assert_called_once_with(size=5000, timeout=5)
+
+    def test_execute_command_shell_false_raises_on_login_prompt_in_output(self, sol, mocker):
+        """execute_command(shell=False, detect_login=True) must bail out if the response looks like a login prompt."""
+        sol._clear_buffer = mocker.Mock()
+        sol.wait_for_string = mocker.Mock()
+        sol._connection_handle = mocker.Mock(before=b"myhost login: ")
+
+        with pytest.raises(SolLoginPromptDetected):
+            sol.execute_command("ver", shell=False, expected_return_codes=None, detect_login=True)
+
+        sol._connection_handle.send.assert_called_once_with("ver\r")
+
+    def test_execute_command_shell_false_detect_login_defaults_to_false(self, sol, mocker):
+        """detect_login now defaults to False: a login-prompt-looking response must NOT raise unless opted in."""
+        sol._clear_buffer = mocker.Mock()
+        sol.wait_for_string = mocker.Mock()
+        sol._connection_handle = mocker.Mock(before=b"myhost login: ")
+
+        result = sol.execute_command("ver", shell=False, expected_return_codes=None)  # detect_login not passed
+
+        assert result.stdout == "myhost login: "
+
+    def test_execute_command_shell_false_no_login_prompt_returns_normally(self, sol, mocker):
+        """Regression check: normal EFI Shell responses must keep working unaffected."""
+        sol._clear_buffer = mocker.Mock()
+        sol.wait_for_string = mocker.Mock()
+        sol._connection_handle = mocker.Mock(before=b"UEFI Shell v2.2 Build 2.6.1")
+
+        result = sol.execute_command("ver", shell=False, expected_return_codes=None, detect_login=True)
+
+        assert result.stdout == "UEFI Shell v2.2 Build 2.6.1"
+
+    def test_execute_command_shell_false_discard_stdout_skips_login_prompt_check(self, sol, mocker):
+        """If stdout is discarded, the login-prompt check is skipped too, even with detect_login=True."""
+        sol._clear_buffer = mocker.Mock()
+        sol.wait_for_string = mocker.Mock()
+        sol._connection_handle = mocker.Mock(before=b"login: ")
+
+        result = sol.execute_command(
+            "ver", shell=False, discard_stdout=True, expected_return_codes=None, detect_login=True
+        )
+
+        assert result.stdout == ""
+
+    @pytest.mark.parametrize("method_name", ["get_os_type", "get_os_name", "get_os_bitness", "get_cpu_architecture"])
+    def test_get_os_methods_raise_on_login_prompt(self, sol, mocker, method_name):
+        sol.cache_system_data = False
+        mocker.patch.object(sol, "_raise_if_login_prompt", side_effect=SolLoginPromptDetected("login:"))
+        check_unix = mocker.patch.object(sol, "_check_if_unix")
+        check_efi = mocker.patch.object(sol, "_check_if_efi_shell")
+
+        with pytest.raises(SolLoginPromptDetected):
+            getattr(sol, method_name)()
+
+        # must bail out before probing OS-specific commands (no username/password typed anywhere)
+        check_unix.assert_not_called()
+        check_efi.assert_not_called()
+
+    @pytest.mark.parametrize("method_name", ["get_os_type", "get_os_name", "get_os_bitness", "get_cpu_architecture"])
+    def test_get_os_methods_unaffected_when_no_login_prompt(self, sol, mocker, method_name):
+        """Regression check: normal detection flow must keep working when no login prompt is present."""
+        sol.cache_system_data = False
+        mocker.patch.object(sol, "_raise_if_login_prompt")
+        mocker.patch.object(sol, "_check_if_unix", return_value=False)
+        mocker.patch.object(sol, "_check_if_efi_shell", return_value=True)
+
+        result = getattr(sol, method_name)()
+
+        assert result is not None
+
+    # --- _send_to_shell: login-prompt detection, echo verification and retry/reset behaviour ---
+
+    def test_raises_immediately_on_login_prompt_text_in_echo(self, sol, mocker):
+        """Concrete evidence of a login prompt must bail out on the very first attempt."""
+        sol = self._ready_for_send_to_shell(sol, mocker)
+        sol._connection_handle.read_nonblocking.return_value = b"Password: "
+
+        with pytest.raises(SolLoginPromptDetected):
+            sol._send_to_shell("uname -a", retry_count=5)
+
+        assert sol._connection_handle.read_nonblocking.call_count == 1
+
+    def test_retries_once_before_succeeding_when_echo_recovers(self, sol, mocker):
+        """A single garbled attempt must not stop the normal retry flow."""
+        sol = self._ready_for_send_to_shell(sol, mocker)
+        sol._connection_handle.read_nonblocking.side_effect = [b"garbled", b"uname -a"]
+
+        sol._send_to_shell("uname -a", retry_count=5)
+
+        assert sol._connection_handle.read_nonblocking.call_count == 2
+        sol._connection_handle.send.assert_any_call(SerialKeyCode.enter.value)
+
+    def test_succeeds_normally_when_command_is_echoed_back(self, sol, mocker):
+        sol = self._ready_for_send_to_shell(sol, mocker)
+        sol._connection_handle.read_nonblocking.return_value = b"uname -a"
+
+        sol._send_to_shell("uname -a", retry_count=5)
+
+        sol._connection_handle.send.assert_any_call(SerialKeyCode.enter.value)
+
+    def test_raises_sol_exception_when_retries_exhausted_after_reset_already_attempted(self, sol, mocker):
+        """retry_count reaches 0 after a communication reset was already attempted - must give up with SolException."""
+        sol = self._ready_for_send_to_shell(sol, mocker)
+
+        with pytest.raises(SolException):
+            sol._send_to_shell("uname -a", retry_count=0, reset_communication=True)
+
+    def test_resets_communication_and_retries_when_retry_count_exhausted_without_prior_reset(self, sol, mocker):
+        """retry_count reaches 0 for the first time - must reset the connection and retry instead of giving up."""
+        sol = self._ready_for_send_to_shell(sol, mocker)
+        reset_mock = mocker.patch.object(sol, "_reset_communication_handle")
+        sol._connection_handle.read_nonblocking.return_value = b"uname -a"
+
+        sol._send_to_shell("uname -a", retry_count=0, reset_communication=False)
+
+        reset_mock.assert_called_once()
+        sol._connection_handle.send.assert_any_call(SerialKeyCode.enter.value)
+
+    def test_timeout_reading_echo_sends_escape_and_enter(self, sol, mocker):
+        """pexpect.TIMEOUT while reading back the echo (empty buffer) must trigger an escape+enter recovery."""
+        sol = self._ready_for_send_to_shell(sol, mocker)
+        sol._connection_handle.read_nonblocking.side_effect = [pexpect.TIMEOUT("timed out"), b"uname -a"]
+
+        sol._send_to_shell("uname -a", retry_count=5)
+
+        sol._connection_handle.send.assert_any_call(SerialKeyCode.escape.value)
